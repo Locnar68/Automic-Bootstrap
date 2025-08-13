@@ -20,6 +20,36 @@ def setup_logging(verbosity: int = 1) -> None:
     datefmt = "%H:%M:%S"
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt)
 
+# ---------- CLI ----------
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Automic AEDB load helper (PostgreSQL)")
+
+    p.add_argument("--db-host", required=True, help="DB server IP/DNS")
+    p.add_argument("--ssh-user", default="ec2-user", help="SSH username (default: ec2-user)")
+    p.add_argument("--key-path", required=True, help="Path to PEM key")
+
+    p.add_argument("--db-name", default="AEDB", help="Database name (default: AEDB)")
+    p.add_argument("--db-user", default="postgres", help="DB superuser on the box (default: postgres)")
+    p.add_argument("--db-password", required=True, help="DB superuser password (kept for future use)")
+
+    # App owner of AEDB
+    p.add_argument("--app-user", default="aauser", help="Automic DB user to own AEDB (default: aauser)")
+    p.add_argument("--app-pass", default="Automic123", help="Password for --app-user (default: Automic123)")
+
+    p.add_argument("--remote-zip", required=True, help="Path to Automic media ZIP on remote host")
+    p.add_argument("--remote-install-root", default="/opt/automic/install", help="Install root (default: /opt/automic/install)")
+    p.add_argument("--remote-utils", default="/opt/automic/utils", help="Utils dir (default: /opt/automic/utils)")
+
+    # Tablespaces
+    p.add_argument("--with-tablespaces", action="store_true", help="Create and wire tablespaces before loading schema")
+    p.add_argument("--ts-data-name", default="ae_data", help="Data tablespace name (default: ae_data)")
+    p.add_argument("--ts-index-name", default="ae_index", help="Index tablespace name (default: ae_index)")
+    p.add_argument("--ts-data-path", default="/pgdata/ts/AE_DATA", help="Path for data tablespace directory")
+    p.add_argument("--ts-index-path", default="/pgdata/ts/AE_INDEX", help="Path for index tablespace directory")
+
+    p.add_argument("--verbosity", "-v", action="count", default=1, help="Increase log verbosity (-vv for debug)")
+    return p.parse_args(argv or sys.argv[1:])
+
 # ---------- SSH wrapper ----------
 @dataclass
 class SSHConfig:
@@ -80,20 +110,15 @@ class SSH:
         finally:
             sftp.close()
 
-# ---------- CLI ----------
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Automic AEDB load helper")
-    p.add_argument("--db-host", required=True, help="DB server IP/DNS")
-    p.add_argument("--ssh-user", default="ec2-user", help="SSH username (default: ec2-user)")
-    p.add_argument("--key-path", required=True, help="Path to PEM key")
-    p.add_argument("--db-name", default="AEDB", help="Database name (default: AEDB)")
-    p.add_argument("--db-user", default="postgres", help="DB superuser (default: postgres)")
-    p.add_argument("--db-password", required=True, help="DB superuser password (not used by local psql calls)")
-    p.add_argument("--remote-zip", required=True, help="Path to Automic media zip on remote host")
-    p.add_argument("--remote-install-root", default="/opt/automic/install", help="Install root (default: /opt/automic/install)")
-    p.add_argument("--remote-utils", default="/opt/automic/utils", help="Utils dir (default: /opt/automic/utils)")
-    p.add_argument("--verbosity", "-v", action="count", default=1, help="Increase log verbosity (-vv for debug)")
-    return p.parse_args(argv or sys.argv[1:])
+    def put_text(self, content: str, remote_path: str, mode: int = 0o755) -> None:
+        """Write a small text file to remote_path and chmod it."""
+        sftp = self.client.open_sftp()
+        try:
+            with sftp.file(remote_path, "w") as f:
+                f.write(content)
+            sftp.chmod(remote_path, mode)
+        finally:
+            sftp.close()
 # ---------- PostgreSQL service helpers ----------
 def detect_pg_service(ssh: SSH) -> str:
     """
@@ -124,13 +149,7 @@ def _port_5432_listening(ssh: SSH) -> bool:
     return bool(out.strip())
 
 def ensure_pg_running(ssh: SSH, unit: str) -> None:
-    """
-    Ensure PostgreSQL is running:
-      1) If 5432 already listening → OK.
-      2) Try start.
-      3) On failure, self-heal: fix /run/postgresql, data perms, PGDATA env, initdb if missing; enable+start.
-    """
-    import shlex
+    """Ensure PostgreSQL is running."""
     log.info("[DB LOAD] Ensure PostgreSQL running...")
 
     if _port_5432_listening(ssh):
@@ -143,33 +162,11 @@ def ensure_pg_running(ssh: SSH, unit: str) -> None:
         ssh.sudo_check("sudo -u postgres psql -XAtc 'SELECT version();'")
         return
 
-    log.warning("  - start failed; applying self-heal and retrying")
-
-    # Runtime socket dir
+    log.warning("  - start failed; applying small self-heal and retrying")
     ssh.sudo("mkdir -p /run/postgresql && chown postgres:postgres /run/postgresql && chmod 775 /run/postgresql")
-
-    # Data dir + ownership
-    ssh.sudo("mkdir -p /var/lib/pgsql/data")
-    ssh.sudo("chown -R postgres:postgres /var/lib/pgsql")
-    ssh.sudo("chmod 700 /var/lib/pgsql/data || true")
-
-    # PGDATA for generic unit
-    ssh.sudo("mkdir -p /etc/sysconfig/pgsql")
-    ssh.sudo("bash -lc 'echo \"PGDATA=\\\"/var/lib/pgsql/data\\\"\" > /etc/sysconfig/pgsql/postgresql'")
-
-    # Initialize cluster if missing
-    rc_init, _, _ = ssh.sudo("test -f /var/lib/pgsql/data/PG_VERSION")
-    if rc_init != 0:
-        ssh.sudo_check("postgresql-setup --initdb")
-
-    # Clear stale locks
-    ssh.sudo("rm -f /var/lib/pgsql/data/postmaster.pid /run/postgresql/.s.PGSQL.5432.lock || true")
-
-    # Enable + start
-    ssh.sudo("systemctl daemon-reload")
+    ssh.sudo("rm -f /run/postgresql/.s.PGSQL.5432.lock || true")
+    ssh.sudo("systemctl daemon-reload || true")
     ssh.sudo_check(f"systemctl enable --now {shlex.quote(unit)}")
-
-    # Verify
     ssh.sudo_check("sudo -u postgres psql -XAtc 'SELECT version();'")
     log.info("  - PostgreSQL is up.")
 
@@ -182,50 +179,7 @@ def ensure_db_exists(ssh: SSH, dbname: str, dbuser: str = "postgres") -> None:
     if not out.strip():
         ssh.sudo_check(f"sudo -u {shlex.quote(dbuser)} createdb {shlex.quote(dbname)}")
 
-def set_vacuum_cost_limit(ssh: SSH, value: int = 4000, dbuser: str = "postgres") -> None:
-    log.info("[DB LOAD] Set vacuum_cost_limit...")
-    ssh.sudo_check(f"sudo -u {shlex.quote(dbuser)} psql -XAtc \"ALTER SYSTEM SET vacuum_cost_limit = {value};\"")
-    ssh.sudo("systemctl reload postgresql-16 || systemctl reload postgresql@16 || systemctl reload postgresql || true")
-# ---------- Tablespaces (no transactions) ----------
-def ensure_tablespaces(
-    ssh: SSH,
-    *,
-    data_ts_name: str = "ae_data",
-    index_ts_name: str = "ae_index",
-    data_path: str = "/pgdata/ts/AE_DATA",
-    index_path: str = "/pgdata/ts/AE_INDEX",
-    dbuser: str = "postgres",
-) -> None:
-    log.info("[DB LOAD] Tablespaces...")
-
-    # Ensure directories and ownership
-    ssh.sudo_check(f"mkdir -p {shlex.quote(data_path)} {shlex.quote(index_path)}")
-    ssh.sudo_check("chown -R postgres:postgres /pgdata/ts")
-    ssh.sudo_check(f"chmod 700 /pgdata/ts {shlex.quote(data_path)} {shlex.quote(index_path)}")
-
-    def ts_exists(name: str) -> bool:
-        rc, out, err = ssh.sudo(
-            f"sudo -u {shlex.quote(dbuser)} psql -XAtc \"SELECT 1 FROM pg_tablespace WHERE spcname='{name}';\""
-        )
-        if rc != 0:
-            raise RuntimeError(f"psql check for tablespace '{name}' failed: {err or out}")
-        return bool(out.strip())
-
-    def create_ts_if_missing(name: str, loc: str) -> None:
-        if ts_exists(name):
-            log.info("  - tablespace %s already present", name)
-            return
-        log.info("  - creating tablespace %s at %s", name, loc)
-        ssh.sudo_check(
-            f"sudo -u {shlex.quote(dbuser)} psql -v ON_ERROR_STOP=1 -Xc "
-            f"\"CREATE TABLESPACE {name} OWNER {dbuser} LOCATION '{loc}';\""
-        )
-
-    create_ts_if_missing(data_ts_name, data_path)
-    create_ts_if_missing(index_ts_name, index_path)
-    log.info("  - tablespaces ensured: %s, %s", data_ts_name, index_ts_name)
-
-# ---------- Prereqs + unzip media ----------
+# ---------- Unzip media and locate db/postgresql ----------
 def _ensure_tool(ssh: SSH, bin_name: str, install_cmd: str) -> None:
     rc, _, _ = ssh.sudo(f"command -v {shlex.quote(bin_name)}")
     if rc != 0:
@@ -234,25 +188,23 @@ def _ensure_tool(ssh: SSH, bin_name: str, install_cmd: str) -> None:
 def ensure_utils_and_unzip(ssh: SSH, remote_utils: str, remote_zip: str, install_root: str) -> str:
     """
     Ensures utils dir exists, tools available, and the product zip is extracted
-    under install_root/<zip-stem>. Returns the extracted dir path.
+    under install_root/<zip-stem>. Returns the path to .../Automation.Platform/db/postgresql
     """
     log.info("[DB LOAD] Prepare utils dir and unzip media...")
     ssh.sudo_check(f"mkdir -p {shlex.quote(remote_utils)}")
     ssh.sudo_check(f"chmod 755 {shlex.quote(remote_utils)}")
 
-    # tools
     _ensure_tool(ssh, "unzip", "dnf -y install unzip || yum -y install unzip || true")
     _ensure_tool(ssh, "rsync", "dnf -y install rsync || yum -y install rsync || true")
 
-    # ensure install root
     ssh.sudo_check(f"mkdir -p {shlex.quote(install_root)}")
 
-    # compute extraction dir
     base = posixpath.basename(remote_zip)
     stem = base[:-4] if base.lower().endswith(".zip") else base
     extract_dir = posixpath.join(install_root, stem)
 
-    # unzip only if needed
+    rc, _, _ = ssh.sudo(f"test -d {shlexquote(extract_dir)}")  # noqa: F821 (we'll fix below)
+    # (fix typo) use posixpath, not shlexquote
     rc, _, _ = ssh.sudo(f"test -d {shlex.quote(extract_dir)}")
     if rc != 0:
         ssh.sudo_check(f"unzip -q -o {shlex.quote(remote_zip)} -d {shlex.quote(extract_dir)}")
@@ -261,190 +213,244 @@ def ensure_utils_and_unzip(ssh: SSH, remote_utils: str, remote_zip: str, install
     else:
         log.info("  - archive already extracted at %s", extract_dir)
 
-    return extract_dir
-# ---------- Version selection + token substitution ----------
+    # Find .../Automation.Platform/db/postgresql
+    find_db = (
+        f"find {shlex.quote(extract_dir)} -maxdepth 5 -type d "
+        f"-path '*/Automation.Platform/db/postgresql' | sort | tail -n1"
+    )
+    rc, out, _ = ssh.sudo("sh -lc " + shlex.quote(find_db))
+    db_pg_root = out.strip()
+    if not db_pg_root:
+        raise RuntimeError(f"Could not locate Automation.Platform/db/postgresql under {extract_dir}")
+    log.info("  - db dir: %s", db_pg_root)
+    return db_pg_root
 
 def _prefer_latest_base_dir(ssh: SSH, root: str) -> Optional[str]:
-    """
-    Pick the highest version directory under .../db/postgresql (e.g., 24.4),
-    NOT the root and NOT the steps subdir.
-    """
+    """Pick the highest version dir under .../db/postgresql (e.g., 24.4)."""
     inner = f"find {shlex.quote(root)} -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' | sort -V"
     rc, out, _ = ssh.sudo("sh -lc " + shlex.quote(inner))
     if rc != 0 or not out.strip():
         return None
-    ver = out.strip().splitlines()[-1].strip()  # highest (last after sort -V)
+    ver = out.strip().splitlines()[-1].strip()
     return posixpath.join(root, ver)
 
-def _preprocess_dir(ssh: SSH, src_dir: str, dst_dir: str, db_user: str) -> str:
-    """
-    Copy SQLs to a temp dir and replace Automic tokens with concrete names.
-    Maps all *data-ish* tokens -> ae_data, *index-ish* -> ae_index, and user/owner -> db_user.
-    """
-    ssh.sudo(f"rm -rf {shlex.quote(dst_dir)} && mkdir -p {shlex.quote(dst_dir)}")
-    ssh.sudo(f"rsync -a {shlex.quote(src_dir)}/ {shlex.quote(dst_dir)}/")
+# ---------- Tablespaces ----------
+def ensure_tablespaces(
+    ssh: SSH,
+    *,
+    dbname: str,
+    app_user: str,
+    data_ts_name: str = "ae_data",
+    index_ts_name: str = "ae_index",
+    data_path: str = "/pgdata/ts/AE_DATA",
+    index_path: str = "/pgdata/ts/AE_INDEX",
+) -> None:
+    log.info("[DB LOAD] Ensuring tablespaces: %s (%s), %s (%s)", data_ts_name, data_path, index_ts_name, index_path)
 
-    # Expanded token list (covers TS_* and legacy P* tokens & owner/user)
-    sed = (
-        r"find {dir} -type f -name '*.sql' -print0 | xargs -0 sed -i "
-        r"-e 's/&TS_DATA#/{ts_data}/g' "
-        r"-e 's/&TS_INDEX#/{ts_index}/g' "
-        r"-e 's/&TS_USER#/{db_user}/g' "
-        r"-e 's/&TS_LOB#/{ts_data}/g' "
-        r"-e 's/&TS_TEMP#/{ts_data}/g' "
-        r"-e 's/&PData#/{ts_data}/g' -e 's/&PDATA#/{ts_data}/g' "
-        r"-e 's/&PIndex#/{ts_index}/g' -e 's/&PINDEX#/{ts_index}/g' "
-        r"-e 's/&PTemp#/{ts_data}/g' -e 's/&PTEMP#/{ts_data}/g' "
-        r"-e 's/&PLog#/{ts_data}/g' -e 's/&PLOG#/{ts_data}/g' "
-        r"-e 's/&PMisc#/{ts_data}/g' -e 's/&PMISC#/{ts_data}/g' "
-        r"-e 's/&User#/{db_user}/g' -e 's/&USER#/{db_user}/g' "
-        r"-e 's/&Owner#/{db_user}/g' -e 's/&OWNER#/{db_user}/g'"
-    ).format(
-        dir=shlex.quote(dst_dir),
-        ts_data="ae_data",
-        ts_index="ae_index",
-        db_user=db_user,
+    # Directories & ownership
+    ssh.sudo_check(f"mkdir -p {shlex.quote(data_path)} {shlex.quote(index_path)}")
+    # chown parent folder to postgres (covers both)
+    parent = posixpath.dirname(data_path.rstrip("/"))
+    ssh.sudo_check(f"chown -R postgres:postgres {shlex.quote(parent)}")
+    ssh.sudo_check(f"chmod 700 {shlex.quote(data_path)} {shlex.quote(index_path)}")
+
+    # Exists?
+    def ts_exists(name: str) -> bool:
+        rc, out, _ = ssh.sudo(f"sudo -u postgres psql -XAtc \"SELECT 1 FROM pg_tablespace WHERE spcname='{name}';\"")
+        return rc == 0 and out.strip() == "1"
+
+    # Create if missing
+    if not ts_exists(data_ts_name):
+        ssh.sudo_check(
+            f"sudo -u postgres psql -v ON_ERROR_STOP=1 -Xc "
+            f"\"CREATE TABLESPACE {data_ts_name} OWNER postgres LOCATION '{data_path}';\""
+        )
+    if not ts_exists(index_ts_name):
+        ssh.sudo_check(
+            f"sudo -u postgres psql -v ON_ERROR_STOP=1 -Xc "
+            f"\"CREATE TABLESPACE {index_ts_name} OWNER postgres LOCATION '{index_path}';\""
+        )
+
+    # Grant usage to app user
+    ssh.sudo_check(
+        f"sudo -u postgres psql -v ON_ERROR_STOP=1 -Xc "
+        f"\"GRANT CREATE, USAGE ON TABLESPACE {data_ts_name} TO \\\"{app_user}\\\";\""
     )
-    ssh.sudo(sed)
-    return dst_dir
-# ---------- Ordered base schema load + steps ----------
+    ssh.sudo_check(
+        f"sudo -u postgres psql -v ON_ERROR_STOP=1 -Xc "
+        f"\"GRANT CREATE, USAGE ON TABLESPACE {index_ts_name} TO \\\"{app_user}\\\";\""
+    )
 
-def _run_base_schema_ordered(ssh: SSH, base_tmp: str, dbname: str, dbuser: str) -> None:
-    """
-    Load base schema in a dependency-friendly order:
-      A) creators for staging tables (stg_*, stgori, stg_ori_) first
-      B) remaining CREATE TABLE files
-      C) the rest (functions, views, grants, etc.)
-      D) ilmswitch.sql LAST
-    """
-    def _sh(cmd: str) -> tuple[int, str, str]:
-        return ssh.sudo("sh -lc " + shlex.quote(cmd))
+    # Set defaults to steer new objects to data TS
+    ssh.sudo_check(
+        f"sudo -u postgres psql -v ON_ERROR_STOP=1 -Xc "
+        f"\"ALTER DATABASE \\\"{dbname}\\\" SET default_tablespace = '{data_ts_name}';\""
+    )
+    ssh.sudo_check(
+        f"sudo -u postgres psql -v ON_ERROR_STOP=1 -Xc "
+        f"\"ALTER ROLE \\\"{app_user}\\\" IN DATABASE \\\"{dbname}\\\" SET default_tablespace = '{data_ts_name}';\""
+    )
 
-    rc, out, err = _sh(f"grep -RIlE 'CREATE[[:space:]]+TABLE[[:space:]]+(stg_|stgori|stg_ori_)' {shlex.quote(base_tmp)} --include '*.sql' | sort || true")
-    stg_files = [ln.strip() for ln in out.strip().splitlines() if ln.strip()] if rc == 0 else []
+    log.info("  - tablespaces ready; defaults set to %s", data_ts_name)
+# ---------- Embedded bash scripts ----------
+FIX_AND_LOAD_SCRIPT = r"""#!/usr/bin/env bash
+set -euo pipefail
 
-    rc, out, err = _sh(f"grep -RIl 'CREATE[[:space:]]\\+TABLE' {shlex.quote(base_tmp)} --include '*.sql' | sort || true")
-    tbl_files = [ln.strip() for ln in out.strip().splitlines() if ln.strip()] if rc == 0 else []
+DB="${DB:-AEDB}"
+APPUSER="${APPUSER:-aauser}"
+APPPASS="${APPPASS:-Automic123}"
+DBDIR="${DBDIR:-/opt/automic/install/Automic.Automation_24.4.1_2025-07-25/Automation.Platform/db/postgresql/24.4}"
 
-    rc, out, err = _sh(f"find {shlex.quote(base_tmp)} -type f -name '*.sql' | sort")
-    all_files = [ln.strip() for ln in out.strip().splitlines() if ln.strip()] if rc == 0 else []
+echo "==> Prechecks"
+sudo -u postgres psql -XAtc "SELECT version();"
 
-    def _without_ilmswitch(paths: list[str]) -> list[str]:
-        return [p for p in paths if not p.endswith("/ilmswitch.sql") and not p.endswith("ilmswitch.sql")]
+echo "==> Ensure app role + DB ownership + schema privileges"
+sudo -u postgres psql -X -v ON_ERROR_STOP=1 -c "DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${APPUSER}') THEN
+    CREATE ROLE \"${APPUSER}\" LOGIN PASSWORD '${APPPASS}';
+  ELSE
+    ALTER ROLE \"${APPUSER}\" LOGIN PASSWORD '${APPPASS}';
+  END IF;
+END $$;"
+sudo -u postgres psql -X -v ON_ERROR_STOP=1 -c "ALTER DATABASE \"${DB}\" OWNER TO \"${APPUSER}\";"
+sudo -u postgres psql -X -d "${DB}" -v ON_ERROR_STOP=1 -c "ALTER SCHEMA public OWNER TO \"${APPUSER}\";"
+sudo -u postgres psql -X -d "${DB}" -v ON_ERROR_STOP=1 -c "GRANT USAGE, CREATE ON SCHEMA public TO \"${APPUSER}\";"
+sudo -u postgres psql -X -v ON_ERROR_STOP=1 -c "GRANT ALL PRIVILEGES ON DATABASE \"${DB}\" TO \"${APPUSER}\";"
 
-    stg_files = _without_ilmswitch(stg_files)
-    tbl_files = _without_ilmswitch(tbl_files)
-    all_files = _without_ilmswitch(all_files)
+echo "==> Ensure extensions (pgcrypto, uuid-ossp)"
+sudo dnf -y install postgresql16-contrib || sudo yum -y install postgresql16-contrib || true
+sudo -u postgres psql -X -d "${DB}" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+sudo -u postgres psql -X -d "${DB}" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
 
-    def _dedup(seq: list[str]) -> list[str]:
-        seen = set(); out = []
-        for x in seq:
-            if x not in seen:
-                seen.add(x); out.append(x)
-        return out
+echo "==> Load Automic base SQLs + steps"
+PSQL="sudo -u \"${APPUSER}\" psql -X -v ON_ERROR_STOP=1 -d \"${DB}\""
 
-    stg_files = _dedup(stg_files)
-    tbl_files = _dedup(tbl_files)
-    all_files = _dedup(all_files)
+# Base files (safe order)
+$PSQL -f "${DBDIR}/check_privileges.sql" || true
+$PSQL -f "${DBDIR}/uc_ddl.sql"
+$PSQL -f "${DBDIR}/after_uc_ddl.sql"
+$PSQL -f "${DBDIR}/create_xevents.sql" || true
+$PSQL -f "${DBDIR}/create_fk_for_E.sql" || true
+$PSQL -f "${DBDIR}/upd_stat.sql" || true
 
-    # Phase A
-    for f in stg_files:
-        log.info(">>> STG    : %s", f)
-        ssh.sudo_check(f"sudo -u {shlex.quote(dbuser)} psql -v ON_ERROR_STOP=1 -X -d {shlex.quote(dbname)} -f {shlex.quote(f)}")
+# Steps
+if [[ -d "${DBDIR}/steps" ]]; then
+  for f in $(find "${DBDIR}/steps" -maxdepth 1 -type f -name 'step_*.sql' | sort); do
+    echo " -> $(basename "$f")"
+    $PSQL -f "$f"
+  done
+fi
 
-    # Phase B
-    stg_set = set(stg_files)
-    for f in tbl_files:
-        if f in stg_set:
-            continue
-        log.info(">>> TABLES : %s", f)
-        ssh.sudo_check(f"sudo -u {shlex.quote(dbuser)} psql -v ON_ERROR_STOP=1 -X -d {shlex.quote(dbname)} -f {shlex.quote(f)}")
+# ilmswitch last
+if [[ -f "${DBDIR}/ilmswitch.sql" ]]; then
+  echo "==> ilmswitch.sql"
+  $PSQL -f "${DBDIR}/ilmswitch.sql" || true
+fi
 
-    # Phase C
-    ran_set = set(stg_files) | set(tbl_files)
-    for f in all_files:
-        if f in ran_set:
-            continue
-        log.info(">>> OTHER  : %s", f)
-        ssh.sudo_check(f"sudo -u {shlex.quote(dbuser)} psql -v ON_ERROR_STOP=1 -X -d {shlex.quote(dbname)} -f {shlex.quote(f)}")
+echo "==> Done schema load."
+"""
 
-    # Phase D
-    rc, out, _ = _sh(f"find {shlex.quote(base_tmp)} -type f -name 'ilmswitch.sql' | head -n1 || true")
-    ilm = out.strip()
-    if ilm:
-        log.info(">>> ILM    : %s", ilm)
-        ssh.sudo_check(f"sudo -u {shlex.quote(dbuser)} psql -v ON_ERROR_STOP=1 -X -d {shlex.quote(dbname)} -f {shlex.quote(ilm)}")
+VERIFY_SCRIPT = r"""#!/usr/bin/env bash
+set -u
+LOG="/tmp/aedb_post_bootstrap_check.log"
+DB="${DB:-AEDB}"
+APPUSER="${APPUSER:-aauser}"
+: > "$LOG"
 
-def load_aedb(ssh: SSH, extracted_root: str, dbname: str, dbuser: str) -> None:
-    log.info("[DB LOAD] Load AEDB contents...")
+say(){ echo -e "$*" | tee -a "$LOG"; }
 
-    # BASE: latest version dir (e.g., .../postgresql/24.4)
-    base_dir = _prefer_latest_base_dir(ssh, extracted_root)
+say "=== Quick AEDB Verify ==="
+sudo -u postgres psql -XAtc "SELECT datname, pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname='${DB}';" | sed 's/^/DB owner: /' | tee -a "$LOG"
+sudo -u postgres psql -XAtd "$DB" -c "SELECT extname, extversion FROM pg_extension ORDER BY 1;" | tee -a "$LOG"
+
+for t in OH AH USR HOST MQSRV MQSRV2; do
+  printf "%-6s : " "$t" | tee -a "$LOG"
+  sudo -u "${APPUSER}" psql -XAtd "$DB" -c "SELECT COUNT(*) FROM \"$t\";" 2>>"$LOG" | tee -a "$LOG" || echo "N/A" | tee -a "$LOG"
+done
+
+echo "--- nspacl(public) ---" | tee -a "$LOG"
+sudo -u postgres psql -XAtd "$DB" -c "SELECT nspname, nspowner::regrole AS owner, nspacl FROM pg_namespace WHERE nspname='public';" | tee -a "$LOG"
+
+cat "$LOG"
+"""
+
+# ---------- Deploy helpers ----------
+def _prefer_latest_base_dir(ssh: SSH, root: str) -> Optional[str]:  # re-define if split across parts
+    inner = f"find {shlex.quote(root)} -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' | sort -V"
+    rc, out, _ = ssh.sudo("sh -lc " + shlex.quote(inner))
+    if rc != 0 or not out.strip():
+        return None
+    ver = out.strip().splitlines()[-1].strip()
+    return posixpath.join(root, ver)
+
+def deploy_and_run_fix_and_load(ssh: SSH, *, db_name: str, app_user: str, app_pass: str, db_pg_root: str) -> None:
+    base_dir = _prefer_latest_base_dir(ssh, db_pg_root)
     if not base_dir:
-        raise RuntimeError(f"Could not find base PostgreSQL dir under: {extracted_root}")
-    log.info("  - using base dir: %s", base_dir)
+        raise RuntimeError(f"Could not find version dir under {db_pg_root}")
+    remote_fix = "/tmp/aedb_fix_and_load.sh"
+    ssh.put_text(FIX_AND_LOAD_SCRIPT, remote_fix, mode=0o755)
+    log.info("  - running %s ...", remote_fix)
+    env = f"DB={shlex.quote(db_name)} APPUSER={shlex.quote(app_user)} APPPASS={shlex.quote(app_pass)} DBDIR={shlex.quote(base_dir)}"
+    ssh.sudo_check(f"{env} {remote_fix}")
 
-    # Mirror base (exclude steps & chngilm*), substitute tokens, then run ordered
-    base_tmp_root = "/tmp/aedb_base_work"
-    ssh.sudo(f"rm -rf {shlex.quote(base_tmp_root)} && mkdir -p {shlex.quote(base_tmp_root)}")
-    ssh.sudo(f"rsync -a --delete --exclude 'steps' --exclude 'chngilm*' {shlex.quote(base_dir)}/ {shlex.quote(base_tmp_root)}/")
-    base_tmp = _preprocess_dir(ssh, base_tmp_root, base_tmp_root, db_user=dbuser)
-    _run_base_schema_ordered(ssh, base_tmp, dbname, dbuser)
-
-    # STEPS: preprocess with same token map and run step_*.sql in order
-    steps_dir = posixpath.join(base_dir, "steps")
-    rc, _, _ = ssh.sudo(f"test -d {shlex.quote(steps_dir)}")
-    if rc == 0:
-        steps_tmp_root = "/tmp/aedb_steps_work"
-        ssh.sudo(f"rm -rf {shlex.quote(steps_tmp_root)} && mkdir -p {shlex.quote(steps_tmp_root)}")
-        ssh.sudo(f"cp -r {shlex.quote(steps_dir)} {shlex.quote(steps_tmp_root)}/")
-
-        steps_tmp = posixpath.join(steps_tmp_root, "steps")
-        _preprocess_dir(ssh, steps_tmp, steps_tmp, db_user=dbuser)
-
-        inner = f"find {shlex.quote(steps_tmp)} -maxdepth 1 -type f -name 'step_*.sql' | sort"
-        rc, out, err = ssh.sudo("sh -lc " + shlex.quote(inner))
-        if rc != 0:
-            raise RuntimeError(f"Failed to enumerate steps under {steps_tmp}.\nSTDERR:\n{err}\nSTDOUT:\n{out}")
-        files = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
-        log.info("  - executing %d step files into %s ...", len(files), dbname)
-        for f in files:
-            ssh.sudo_check(
-                f"sudo -u {shlex.quote(dbuser)} psql -v ON_ERROR_STOP=1 -X -d {shlex.quote(dbname)} -f {shlex.quote(f)}"
-            )
-
-    log.info("  - AEDB base + steps load completed.")
+def deploy_and_run_verify(ssh: SSH, *, db_name: str, app_user: str) -> None:
+    remote_verify = "/tmp/aedb_verify_quick.sh"
+    ssh.put_text(VERIFY_SCRIPT, remote_verify, mode=0o755)
+    log.info("  - running %s ...", remote_verify)
+    env = f"DB={shlex.quote(db_name)} APPUSER={shlex.quote(app_user)}"
+    out = ssh.sudo_check(f"{env} {remote_verify}")
+    for line in out.splitlines()[-30:]:
+        log.info("[VERIFY] %s", line)
 # ---------- Orchestrator ----------
 def run_db_load(
     db_host: str,
     key_path: str,
     db_name: str,
     db_user: str,
-    db_password: str,  # currently unused in remote psql calls, kept for future JDBC/remote psql
+    db_password: str,  # kept for future JDBC/remote psql
     remote_zip: str,
     ssh_user: str = "ec2-user",
     remote_install_root: str = "/opt/automic/install",
     remote_utils: str = "/opt/automic/utils",
+    app_user: str = "aauser",
+    app_pass: str = "Automic123",
+    with_tablespaces: bool = False,
+    ts_data_name: str = "ae_data",
+    ts_index_name: str = "ae_index",
+    ts_data_path: str = "/pgdata/ts/AE_DATA",
+    ts_index_path: str = "/pgdata/ts/AE_INDEX",
 ) -> None:
-    setup_logging()
-    log.info("Complete!")  # mirror your banner
+    log.info("== Automic AEDB DB Load ==")
 
     ssh_cfg = SSHConfig(host=db_host, user=ssh_user, key_path=key_path)
     with SSH(ssh_cfg) as ssh:
-        # Detect service, ensure running (port-first), then DB + tuning
+        # 1) Ensure PG is up
         unit = detect_pg_service(ssh)
         ensure_pg_running(ssh, unit)
+
+        # 2) Ensure AEDB exists
         ensure_db_exists(ssh, db_name, db_user)
-        set_vacuum_cost_limit(ssh, 4000, db_user)
 
-        # Ensure tablespaces (no transactions)
-        ensure_tablespaces(ssh, dbuser=db_user)
+        # 3) Unzip media and locate db/postgresql
+        db_pg_root = ensure_utils_and_unzip(ssh, remote_utils, remote_zip, remote_install_root)
 
-        # Prepare utils & unzip media
-        extracted = ensure_utils_and_unzip(ssh, remote_utils, remote_zip, remote_install_root)
+        # 3.5) Optional: ensure tablespaces and set defaults
+        if with_tablespaces:
+            ensure_tablespaces(
+                ssh,
+                dbname=db_name,
+                app_user=app_user,
+                data_ts_name=ts_data_name,
+                index_ts_name=ts_index_name,
+                data_path=ts_data_path,
+                index_path=ts_index_path,
+            )
 
-        # Load AEDB: base (ordered) + steps
-        load_aedb(ssh, extracted, db_name, db_user)
+        # 4) Upload & run on-box bash loader (roles/privs/exts + base SQL + steps + ilmswitch)
+        deploy_and_run_fix_and_load(ssh, db_name=db_name, app_user=app_user, app_pass=app_pass, db_pg_root=db_pg_root)
+
+        # 5) Quick verify + log tail
+        deploy_and_run_verify(ssh, db_name=db_name, app_user=app_user)
 
     log.info("[DB LOAD] Done.")
 
@@ -463,6 +469,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             ssh_user=args.ssh_user,
             remote_install_root=args.remote_install_root,
             remote_utils=args.remote_utils,
+            app_user=getattr(args, "app_user", "aauser"),
+            app_pass=getattr(args, "app_pass", "Automic123"),
+            with_tablespaces=getattr(args, "with_tablespaces", False),
+            ts_data_name=getattr(args, "ts_data_name", "ae_data"),
+            ts_index_name=getattr(args, "ts_index_name", "ae_index"),
+            ts_data_path=getattr(args, "ts_data_path", "/pgdata/ts/AE_DATA"),
+            ts_index_path=getattr(args, "ts_index_path", "/pgdata/ts/AE_INDEX"),
         )
         return 0
     except Exception as e:
