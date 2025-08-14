@@ -33,7 +33,7 @@ Instead of a rigid spec, Vibe Coding means:
 1. Describing the goal in natural language.
 2. Iterating with ChatGPT to design scripts, run tests, debug.
 3. Adapting instantly based on output and feedback.
-4. Integrating Bash, Python, and SQL across remote systems.
+4. Integrating Bash, Python, and SQL across remote systems..
 
 ### Requirements
 
