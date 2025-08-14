@@ -1,0 +1,95 @@
+*** a/automic_bootstrap/cli.py
+--- b/automic_bootstrap/cli.py
+***************
+*** 1,10 ****
+  from __future__ import annotations
+  
+  import sys
+  import argparse
+  import logging
+  from pathlib import Path
+  
+  # package version for --version flag
+  try:
+      from importlib.metadata import version as _pkg_version
+--- 1,12 ----
+  from __future__ import annotations
+  
+  import sys
+  import argparse
+  import logging
+  from pathlib import Path
++ 
++ # NEW: optional preflight integration
++ try:
++     from .tools.preflight_entry import run_preflight as _run_preflight
++ except Exception:
++     _run_preflight = None
+  
+  # package version for --version flag
+  try:
+      from importlib.metadata import version as _pkg_version
+***************
+*** 50,55 ****
+--- 52,79 ----
+      prov.add_argument(
+          "--automic-zip", required=False, type=Path,
+          help=f"Path to Automic bundle (.zip/.tar.gz). If omitted, uses ./{DEFAULT_ARCHIVE_NAME}."
+      )
+  
++     # NEW: preflight subcommand
++     pre = sub.add_parser(
++         "preflight", parents=[common],
++         help="Run readiness checks (venv, AWS CLI, bundle, key, STS creds)."
++     )
++ 
++     # OPTIONAL: wire preflight into verify (verify will call preflight first)
++     ver = sub.add_parser(
++         "verify", parents=[common],
++         help="Run final verification. (Runs 'preflight' first if available.)"
++     )
++ 
++     return p
++ 
++ 
++ def _cmd_preflight(_: argparse.Namespace) -> int:
++     if _run_preflight is None:
++         print("Preflight not available. Ensure preflight.py exists at project root.")
++         return 1
++     return _run_preflight()
++ 
++ 
+  def main(argv: list[str] | None = None) -> int:
+      argv = argv or sys.argv[1:]
+      parser = _build_parser()
+      args = parser.parse_args(argv)
+      setup_logging(args.log_level)
+***************
+*** 65,70 ****
+--- 89,112 ----
+          # existing provision flow...
+          pass
+  
++     elif args.cmd == "preflight":
++         return _cmd_preflight(args)
++ 
++     elif args.cmd == "verify":
++         # run preflight first, but don't fail verify just because preflight warned
++         if _run_preflight is not None:
++             try:
++                 rc = _run_preflight()
++                 if rc != 0:
++                     logging.warning("Preflight returned non-zero; continuing to verify stage.")
++             except Exception as e:  # pragma: no cover
++                 logging.warning("Preflight raised an error: %s", e)
++         # then run your existing final_verification if present
++         try:
++             from .components.verify import final_verification
++             return final_verification()
++         except Exception as e:
++             logging.error("Verification not available: %s", e)
++             return 2
++ 
+      else:
+          parser.print_help()
+          return 2

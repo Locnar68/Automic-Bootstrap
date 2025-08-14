@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+
 @dataclass
 class Settings:
     region: str = "us-east-1"
@@ -15,5 +16,6 @@ class Settings:
     ae_type: str = "t3.micro"
     awi_type: str = "t3.micro"
     db_sys_pass: str = "Automic123"
+
 
 DEF_SETTINGS = Settings()

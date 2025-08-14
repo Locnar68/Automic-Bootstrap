@@ -1,24 +1,24 @@
 # automic_bootstrap/automic_bootstrap/orchestrators/stack.py
+import logging
 import os
 import stat
 import time
-import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any
 
 import boto3
 import botocore
 import paramiko
 
-from ..config import Settings
 from ..aws.ec2 import (
-    ensure_vpc,
     ensure_security_group,
+    ensure_vpc,
+    get_instance_ip,
     get_latest_ami,
     launch_ec2_instance,
     wait_for_instances,
-    get_instance_ip,
 )
+from ..config import Settings
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ def _recreate_keypair(ec2_client, key_name: str, key_dir: Path) -> Path:
 
 def wait_for_ssh_ready(ip: str, key_path: Path, timeout: int = 300) -> None:
     start = time.time()
-    last_err: Optional[Exception] = None
+    last_err: Exception | None = None
     while time.time() - start < timeout:
         try:
             key = paramiko.RSAKey.from_private_key_file(str(key_path))
@@ -117,7 +117,7 @@ def wait_for_ssh_ready(ip: str, key_path: Path, timeout: int = 300) -> None:
     raise TimeoutError(f"SSH not ready on {ip} after {timeout}s; last error: {last_err}")
 
 
-def launch_automic_stack(cfg: Settings, db_user_pass: str) -> Dict[str, Any]:
+def launch_automic_stack(cfg: Settings, db_user_pass: str) -> dict[str, Any]:
     """
     Provisions VPC/SG, recreates keypair+PEM idempotently, launches DB/AE/AWI,
     waits for instances + SSH, and returns a dict used by the CLI.

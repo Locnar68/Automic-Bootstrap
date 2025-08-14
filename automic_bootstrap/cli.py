@@ -1,25 +1,27 @@
 # automic_bootstrap/automic_bootstrap/cli.py
 from __future__ import annotations
 
-import sys
 import argparse
 import logging
+import sys
 from pathlib import Path
 
 # package version for --version flag
 try:
     from importlib.metadata import version as _pkg_version
+
     __VERSION__ = _pkg_version("automic-bootstrap")
 except Exception:
     __VERSION__ = "0.0.0+dev"
 
+from .config import DEF_SETTINGS, Settings
 from .logging_setup import setup_logging
-from .config import Settings, DEF_SETTINGS
 from .orchestrators.stack import launch_automic_stack
 
 # Optional imports; capture import errors for visibility
 try:
     from .components.transfer import upload_automic_archive
+
     _TRANSFER_IMPORT_ERROR = None
 except Exception as e:
     upload_automic_archive = None  # type: ignore
@@ -27,6 +29,7 @@ except Exception as e:
 
 try:
     from .components.db_load import run_db_load
+
     _DBLOAD_IMPORT_ERROR = None
 except Exception as e:
     run_db_load = None  # type: ignore
@@ -34,6 +37,7 @@ except Exception as e:
 
 try:
     from .components.verify import final_verification
+
     _VERIFY_IMPORT_ERROR = None
 except Exception as e:
     final_verification = None  # type: ignore
@@ -41,11 +45,11 @@ except Exception as e:
 
 try:
     from .components.backup import backup_database
+
     _BACKUP_IMPORT_ERROR = None
 except Exception as e:
     backup_database = None  # type: ignore
     _BACKUP_IMPORT_ERROR = e
-
 
 # Default archive name (no prompt; assumed present unless --automic-zip provided)
 DEFAULT_ARCHIVE_NAME = "Automic.Automation_24.4.1_2025-07-25.zip"
@@ -95,39 +99,63 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # provision: infra + upload archive + AEDB load
+    # ---- provision: infra + upload archive + AEDB load
     prov = sub.add_parser(
-        "provision", parents=[common],
+        "provision",
+        parents=[common],
         help="Provision/reuse AWS infra, upload Automic archive, and load AEDB",
     )
     prov.add_argument(
-        "--automic-zip", required=False, type=Path,
-        help=f"Path to Automic bundle (.zip/.tar.gz). If omitted, uses ./{DEFAULT_ARCHIVE_NAME}."
+        "--automic-zip",
+        required=False,
+        type=Path,
+        help=f"Path to Automic bundle (.zip/.tar.gz). If omitted, uses ./{DEFAULT_ARCHIVE_NAME}.",
     )
 
-    # all: currently mirrors provision, future stages can be added
+    # ---- all: currently mirrors provision (future stages can be added)
     allp = sub.add_parser(
-        "all", parents=[common],
+        "all",
+        parents=[common],
         help="Provision/reuse infra, upload & load AEDB, then (optionally) install AE/AWI/SM",
     )
     allp.add_argument(
-        "--automic-zip", required=False, type=Path,
-        help=f"Path to Automic bundle (.zip/.tar.gz). If omitted, uses ./{DEFAULT_ARCHIVE_NAME}."
+        "--automic-zip",
+        required=False,
+        type=Path,
+        help=f"Path to Automic bundle (.zip/.tar.gz). If omitted, uses ./{DEFAULT_ARCHIVE_NAME}.",
     )
 
-    # verify
+    # ---- verify
     sub.add_parser(
-        "verify", parents=[common],
+        "verify",
+        parents=[common],
         help="Run verification checks (logs, versions, connectivity)",
     )
 
-    # backup-db
+    # ---- backup-db
     sub.add_parser(
-        "backup-db", parents=[common],
+        "backup-db",
+        parents=[common],
         help="Backup the AEDB using pg_dump",
     )
 
+    # ---- deprovision
+    deprov = sub.add_parser(
+        "deprovision",
+        parents=[common],
+        help="Tear down AWS resources created by provision (EC2, SG, key pair)",
+    )
+    # Unique flag for this subcommand
+    deprov.add_argument(
+        "--name-prefix",
+        action="append",
+        default=["automic-", "AEDB", "AE", "AWI"],
+        help="Instance Name tag prefixes to match (repeatable). Default: %(default)r",
+    )
+
     return p
+
+
 def _settings_from_args(args: argparse.Namespace) -> Settings:
     """
     Build a Settings object from DEF_SETTINGS + CLI overrides.
@@ -162,6 +190,7 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
     # 2) dataclass
     try:
         import dataclasses
+
         if dataclasses.is_dataclass(base):
             return dataclasses.replace(base, **updates)  # type: ignore[arg-type]
     except Exception:
@@ -187,6 +216,7 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
     except Exception:
         # 6) Last resort: mutate a shallow clone
         import copy
+
         s = copy.copy(base)
         for k, v in updates.items():
             setattr(s, k, v)
@@ -198,6 +228,7 @@ def _resolve_archive_path(p: Path | None) -> Path:
     No prompt. If --automic-zip not given, assume DEFAULT in CWD.
     Fail fast if the file isn't found.
     """
+
     def _norm(x: Path) -> Path:
         return Path(x).expanduser().resolve()
 
@@ -208,6 +239,8 @@ def _resolve_archive_path(p: Path | None) -> Path:
             f"(expected {DEFAULT_ARCHIVE_NAME} in the current directory or pass --automic-zip)"
         )
     return path
+
+
 def _do_provision(args: argparse.Namespace) -> int:
     settings = _settings_from_args(args)
     setup_logging(settings.log_file)
@@ -217,7 +250,9 @@ def _do_provision(args: argparse.Namespace) -> int:
     try:
         pw = getattr(settings, "db_sys_pass", None) or getattr(settings, "db_password", None)
         if not pw:
-            raise RuntimeError("DB password missing in Settings (expected db_sys_pass or db_password).")
+            raise RuntimeError(
+                "DB password missing in Settings (expected db_sys_pass or db_password)."
+            )
 
         # stack must be a dict with keys: db_ip, key_path
         stack = launch_automic_stack(settings, db_user_pass=pw)
@@ -281,6 +316,95 @@ def _do_provision(args: argparse.Namespace) -> int:
     return 0
 
 
+def _do_deprovision(args: argparse.Namespace) -> int:
+    """Tear down AWS resources created by provision."""
+    import time
+
+    import boto3
+    import botocore
+
+    settings = _settings_from_args(args)
+    setup_logging(settings.log_file)
+    logging.info("=== Deprovision start (region=%s) ===", settings.region)
+
+    ec2 = boto3.client("ec2", region_name=settings.region)
+
+    def find_automic_instances(name_prefixes=["automic-", "AEDB", "AE", "AWI"]):
+        resp = ec2.describe_instances(
+            Filters=[
+                {
+                    "Name": "instance-state-name",
+                    "Values": ["pending", "running", "stopping", "stopped"],
+                }
+            ]
+        )
+        ids = []
+        for res in resp.get("Reservations", []):
+            for inst in res.get("Instances", []):
+                for tag in inst.get("Tags", []):
+                    if tag.get("Key") == "Name" and any(
+                        str(tag.get("Value", "")).startswith(p) for p in name_prefixes
+                    ):
+                        ids.append(inst["InstanceId"])
+        return ids
+
+    def terminate_instances(ids):
+        if not ids:
+            logging.info("No Automic instances found to terminate.")
+            return
+        logging.info("Terminating instances: %s", ids)
+        ec2.terminate_instances(InstanceIds=ids)
+        waiter = ec2.get_waiter("instance_terminated")
+        waiter.wait(InstanceIds=ids)
+        logging.info("Instance termination complete.")
+
+    def delete_security_group(sg_name, vpc_id=None):
+        filters = [{"Name": "group-name", "Values": [sg_name]}]
+        if vpc_id:
+            filters.append({"Name": "vpc-id", "Values": [vpc_id]})
+        resp = ec2.describe_security_groups(Filters=filters)
+        groups = resp.get("SecurityGroups", [])
+        if not groups:
+            logging.info("Security group '%s' not found.", sg_name)
+            return
+        sg_id = groups[0]["GroupId"]
+        logging.info("Found Security Group '%s' with ID: %s", sg_name, sg_id)
+        try:
+            ec2.delete_security_group(GroupId=sg_id)
+            logging.info("Security group deleted.")
+        except botocore.exceptions.ClientError as e:
+            logging.warning("Initial deletion failed: %s", e)
+            if "DependencyViolation" in str(e):
+                logging.info("Retrying SG delete after 10s...")
+                time.sleep(10)
+                ec2.delete_security_group(GroupId=sg_id)
+                logging.info("Security group deleted after retry.")
+
+    def delete_key_pair(key_name, pem_dir: Path):
+        try:
+            ec2.delete_key_pair(KeyName=key_name)
+            logging.info("AWS key pair deleted.")
+        except botocore.exceptions.ClientError as e:
+            logging.warning("Could not delete AWS key pair: %s", e)
+        pem_path = pem_dir / f"{key_name}.pem"
+        if pem_path.exists():
+            pem_path.unlink()
+            logging.info("Local PEM deleted at %s.", pem_path)
+
+    # Execute cleanup steps
+    ids = find_automic_instances(
+        getattr(args, "name_prefix", None) or ["automic-", "AEDB", "AE", "AWI"]
+    )
+    terminate_instances(ids)
+    delete_security_group(
+        settings.sg_name, settings.vpc_id if hasattr(settings, "vpc_id") else None
+    )
+    delete_key_pair(settings.key_name, settings.key_dir)
+
+    logging.info("=== Deprovision complete ===")
+    return 0
+
+
 def _do_all(args: argparse.Namespace) -> int:
     rc = _do_provision(args)
     if rc != 0:
@@ -317,24 +441,35 @@ def _do_backup(args: argparse.Namespace) -> int:
     except Exception as e:
         logging.exception("Backup failed: %s", e)
         return 21
+
+
 def main(argv: list[str] | None = None) -> int:
-    if argv is None:
-        argv = sys.argv[1:]
+    argv = sys.argv[1:] if argv is None else argv
     parser = _build_parser()
+
+    # If user ran without args, show help
+    if not argv:
+        parser.print_help()
+        return 2
+
     args = parser.parse_args(argv)
 
-    # Dispatch
-    if args.cmd == "provision":
-        return _do_provision(args)
-    if args.cmd == "all":
-        return _do_all(args)
-    if args.cmd == "verify":
-        return _do_verify(args)
-    if args.cmd == "backup-db":
-        return _do_backup(args)
+    # Dispatch table for subcommands
+    dispatch = {
+        "provision": _do_provision,
+        "all": _do_all,
+        "verify": _do_verify,
+        "backup-db": _do_backup,
+        "deprovision": _do_deprovision,
+    }
 
-    parser.print_help()
-    return 1
+    cmd = getattr(args, "cmd", None)
+    func = dispatch.get(cmd)
+    if not func:
+        parser.print_help()
+        return 2
+
+    return func(args)
 
 
 if __name__ == "__main__":

@@ -4,16 +4,28 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "automic-bootstrap"
-version = "0.1.2"
-description = "Modular Automic AWS bootstrap (AEDB, AE, AWI)"
+version = "0.1.0"
+description = "AWS bootstrapper for Broadcom Automic (provision + install pipeline)"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["boto3>=1.28", "paramiko>=3.3", "jinja2>=3.1"]
+authors = [{ name = "Your Name", email = "you@example.com" }]
+license = { text = "MIT" }
+keywords = ["automic", "aws", "bootstrap", "automation"]
+
+dependencies = [
+    "boto3",
+    "botocore",
+    "paramiko",
+    "Jinja2",
+    # Optional: uncomment if you add them
+    # "psycopg2-binary",
+    # "requests",
+    # "rich",
+]
 
 [project.scripts]
 automic-bootstrap = "automic_bootstrap.cli:main"
 
-# 👇 Add this block to enable package discovery
-[tool.setuptools.packages.find]
-where = ["automic_bootstrap"]
-include = ["automic_bootstrap*"]
+[tool.ruff]
+line-length = 100
+target-version = "py310"

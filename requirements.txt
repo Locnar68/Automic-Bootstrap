@@ -1,0 +1,4 @@
+Jinja2
+boto3
+botocore
+paramiko

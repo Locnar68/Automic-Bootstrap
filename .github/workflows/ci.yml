@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip wheel
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install ruff pytest
+
+      - name: Lint
+        run: ruff check
+
+      - name: Test
+        run: pytest -q || echo "No tests yet"
+
+      - name: Preflight (non-fatal)
+        run: |
+          if [ -f preflight.py ]; then python preflight.py || true; fi

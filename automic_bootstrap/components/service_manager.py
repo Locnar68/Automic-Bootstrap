@@ -1,7 +1,9 @@
 import logging
 from pathlib import Path
-from ..remote.ssh import ssh_exec
+
 from ..remote.sftp import sftp_put
+from ..remote.ssh import ssh_exec
+
 
 def install_service_manager(ae_ip: str, key_path: Path, sm_tar: Path | None = None) -> None:
     if not sm_tar:

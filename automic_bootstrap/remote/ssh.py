@@ -1,6 +1,9 @@
 import paramiko
 
-def ssh_exec(host: str, key_path, cmd: str, sudo: bool=False, username: str="ec2-user", timeout: int=60):
+
+def ssh_exec(
+    host: str, key_path, cmd: str, sudo: bool = False, username: str = "ec2-user", timeout: int = 60
+):
     if sudo and not cmd.strip().startswith("sudo"):
         cmd = "sudo " + cmd
     key = paramiko.RSAKey.from_private_key_file(str(key_path))

@@ -1,9 +1,11 @@
 # automic_bootstrap/automic_bootstrap/components/transfer.py
-from pathlib import Path
 import logging
+from pathlib import Path
+
 import paramiko
 
 log = logging.getLogger(__name__)
+
 
 def _run(ssh: paramiko.SSHClient, cmd: str) -> None:
     stdin, stdout, stderr = ssh.exec_command(cmd)
@@ -11,11 +13,19 @@ def _run(ssh: paramiko.SSHClient, cmd: str) -> None:
     if rc != 0:
         err = stderr.read().decode("utf-8", "ignore")
         out = stdout.read().decode("utf-8", "ignore")
-        raise RuntimeError(f"Remote command failed (rc={rc}): {cmd}\nSTDOUT:\n{out}\nSTDERR:\n{err}")
+        raise RuntimeError(
+            f"Remote command failed (rc={rc}): {cmd}\nSTDOUT:\n{out}\nSTDERR:\n{err}"
+        )
 
-def upload_automic_archive(local_zip: Path, host, key_path: Path, *,
-                           username: str = "ec2-user",
-                           remote_dir: str = "/opt/automic/install") -> str:
+
+def upload_automic_archive(
+    local_zip: Path,
+    host,
+    key_path: Path,
+    *,
+    username: str = "ec2-user",
+    remote_dir: str = "/opt/automic/install",
+) -> str:
     """
     Upload the Automic bundle to the remote host and return the remote path.
     """
