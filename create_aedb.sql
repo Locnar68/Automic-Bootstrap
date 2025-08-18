@@ -1,0 +1,21 @@
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='aauser') THEN
+    CREATE ROLE aauser LOGIN PASSWORD 'Automic123';
+  ELSE
+    ALTER ROLE aauser WITH LOGIN PASSWORD 'Automic123';
+  END IF;
+END
+$$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname='AEDB') THEN
+    EXECUTE format('CREATE DATABASE %I OWNER %I TEMPLATE template0', 'AEDB', 'aauser');
+  END IF;
+END
+$$;
+
+\connect AEDB
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";

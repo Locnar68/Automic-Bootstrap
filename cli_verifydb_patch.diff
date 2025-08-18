@@ -1,0 +1,98 @@
+--- cli.py
++++ cli.py
+@@ -6,6 +6,8 @@
+ import sys
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, cast
++import shlex
++import paramiko
+ 
+ # Optional AE import (guarded)
+ try:
+@@ -186,6 +188,15 @@
+         parents=[common],
+         help="Backup the AEDB using pg_dump",
+     )
++    # ---- verify-db: lightweight AEDB smoke check
++    vdb = sub.add_parser(
++        "verify-db",
++        parents=[common],
++        help="Check AEDB: version, extensions, key tables (ids/ah/eca).",
++    )
++    vdb.add_argument("--db-host", required=True, help="DB host (EC2 IP/DNS)")
++    vdb.add_argument("--key-path", required=True, help="Path to PEM key")
++
+ 
+     # ---- deprovision
+     deprov = sub.add_parser(
+@@ -386,6 +397,62 @@
+         return 7
+ 
+ 
++
++def _do_verify_db(args: argparse.Namespace) -> int:
++    """Lightweight AEDB smoke check over SSH."""
++    setup_logging(verbosity=1, logfile=args.log_file)
++
++    host = args.db_host
++    user = args.ssh_user
++    key_path = str(args.key_path)
++    db = args.db_name
++
++    client = paramiko.SSHClient()
++    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
++    try:
++        pkey = paramiko.RSAKey.from_private_key_file(key_path)
++        client.connect(hostname=host, username=user, pkey=pkey, port=22, timeout=30, banner_timeout=30, auth_timeout=30)
++
++        def run(cmd: str) -> tuple[int, str, str]:
++            full = f"/bin/bash -lc {shlex.quote(cmd)}"
++            stdin, stdout, stderr = client.exec_command(full)
++            rc = stdout.channel.recv_exit_status()
++            out = stdout.read().decode("utf-8", "ignore")
++            err = stderr.read().decode("utf-8", "ignore")
++            return rc, out, err
++
++        def psql(sql: str) -> str:
++            rc, out, err = run(f"sudo -u postgres psql -d {shlex.quote(db)} -Atqc {shlex.quote(sql)}")
++            if rc != 0:
++                raise RuntimeError(f"psql failed: {sql}\nSTDOUT:\n{out}\nSTDERR:\n{err}")
++            return out.strip()
++
++        rows = {
++            "pg_version": psql("select version();"),
++            "ext_pgcrypto": psql("select count(*) from pg_extension where extname='pgcrypto';"),
++            "ext_uuid_ossp": psql("select count(*) from pg_extension where extname='uuid-ossp';"),
++            "has_ids": psql("select count(*) from pg_class where relname='ids';"),
++            "has_ah": psql("select count(*) from pg_class where relname='ah';"),
++            "has_eca": psql("select count(*) from pg_class where relname='eca';"),
++        }
++
++        print("== AEDB check ==")
++        print(f"- version: {rows['pg_version']}")
++        print(f"- pgcrypto installed: {'yes' if rows['ext_pgcrypto']!='0' else 'no'}")
++        print(f"- uuid-ossp installed: {'yes' if rows['ext_uuid_ossp']!='0' else 'no'}")
++        print(f"- tables: ids={rows['has_ids']} ah={rows['has_ah']} eca={rows['has_eca']}")
++        return 0
++    except Exception as e:
++        logging.exception("verify-db failed: %s", e)
++        return 12
++    finally:
++        try:
++            client.close()
++        except Exception:
++            pass
++
++
++
+ def _do_install_ae(args: argparse.Namespace) -> int:
+     """Configure AE in-place; Service Manager will own start/stop later."""
+     setup_logging(verbosity=1, logfile=args.log_file)
+@@ -563,6 +630,7 @@
+         "install-db": _do_install_db,
+         "install-ae": _do_install_ae,
+         "verify": _do_verify,
++        "verify-db": _do_verify_db,
+         "backup-db": _do_backup,
+         "deprovision": _do_deprovision,
+     }

@@ -1,0 +1,648 @@
+# automic_bootstrap/cli.py
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, cast
+import shlex
+import paramiko
+
+# Optional AE import (guarded)
+try:
+    from .components.ae_engine import run_install_ae, AEInstallConfig
+    _AE_IMPORT_ERROR = None
+except Exception as e:
+    run_install_ae = None  # type: ignore[assignment]
+    AEInstallConfig = None  # type: ignore[assignment]
+    _AE_IMPORT_ERROR = e
+
+# Small helpers to keep mypy/pyright happy when reading boto3 dicts
+def _dg(d: Any, key: str, default: Any) -> Any:
+    """Dict-get that is typing-friendly and key-safe."""
+    return d[key] if isinstance(d, dict) and key in d else default
+
+def _as_list(obj: Any) -> List[Any]:
+    return obj if isinstance(obj, list) else []
+
+# Package version for --version flag
+try:
+    from importlib.metadata import version as _pkg_version
+    __VERSION__ = _pkg_version("automic-bootstrap")
+except Exception:
+    __VERSION__ = "0.0.0+dev"
+
+from .config import DEF_SETTINGS, Settings
+from .logging_setup import setup_logging
+from .orchestrators.stack import launch_automic_stack
+
+# Optional imports; capture errors for visibility
+try:
+    from .components.transfer import upload_automic_archive
+    _TRANSFER_IMPORT_ERROR = None
+except Exception as e:
+    upload_automic_archive = None  # type: ignore[assignment]
+    _TRANSFER_IMPORT_ERROR = e
+
+try:
+    from .components.db_load import run_db_load
+    _DBLOAD_IMPORT_ERROR = None
+except Exception as e:
+    run_db_load = None  # type: ignore[assignment]
+    _DBLOAD_IMPORT_ERROR = e
+
+try:
+    from .components.verify import final_verification
+    _VERIFY_IMPORT_ERROR = None
+except Exception as e:
+    final_verification = None  # type: ignore[assignment]
+    _VERIFY_IMPORT_ERROR = e
+
+# Default archive name (used if --automic-zip omitted)
+DEFAULT_ARCHIVE_NAME = "Automic.Automation_24.4.1_2025-07-25.zip"
+def _common_parent() -> argparse.ArgumentParser:
+    """Options shared by all commands."""
+    common = argparse.ArgumentParser(add_help=False)
+
+    # AWS
+    common.add_argument("--region", default=DEF_SETTINGS.region)
+    common.add_argument("--vpc-id", default=DEF_SETTINGS.vpc_id)
+    common.add_argument("--sg-name", default=DEF_SETTINGS.sg_name)
+    common.add_argument("--key-name", default=DEF_SETTINGS.key_name)
+    common.add_argument("--key-dir", type=Path, default=DEF_SETTINGS.key_dir)
+
+    # Node types / names
+    common.add_argument("--db-name", default=DEF_SETTINGS.db_name)
+    common.add_argument("--ae-name", default=DEF_SETTINGS.ae_name)
+    common.add_argument("--awi-name", default=DEF_SETTINGS.awi_name)
+    common.add_argument("--db-type", default=DEF_SETTINGS.db_type)
+    common.add_argument("--ae-type", default=DEF_SETTINGS.ae_type)
+    common.add_argument("--awi-type", default=DEF_SETTINGS.awi_type)
+
+    # SSH / paths
+    common.add_argument("--ssh-user", default=getattr(DEF_SETTINGS, "ssh_user", "ec2-user"))
+    common.add_argument("--remote-install-root", default="/opt/automic/install")
+    common.add_argument("--remote-utils", default="/opt/automic/utils")
+
+    # DB creds
+    # IMPORTANT: default db-user to aauser (what AE should use to connect)
+    common.add_argument("--db-user", default=getattr(DEF_SETTINGS, "db_user", "aauser"))
+    # System/superuser password (used by infra stage; not needed for db_load which uses sudo -u postgres)
+    common.add_argument("--db-sys-pass", default=DEF_SETTINGS.db_sys_pass)
+
+    # Logging
+    common.add_argument("--log-file", default="bootstrap.log")
+    return common
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    common = _common_parent()
+    p = argparse.ArgumentParser(
+        prog="automic-bootstrap",
+        description="Automic AWS Bootstrap (provision + install AEDB, AE, AWI)",
+        parents=[common],
+    )
+    p.add_argument("--version", action="version", version=f"automic-bootstrap {__VERSION__}")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # ---- provision: infra + upload archive + AEDB load
+    prov = sub.add_parser(
+        "provision",
+        parents=[common],
+        help="Provision/reuse AWS infra, upload Automic archive, and load AEDB",
+    )
+    prov.add_argument(
+        "--automic-zip",
+        required=False,
+        type=Path,
+        help=f"Path to Automic bundle (.zip/.tar.gz). If omitted, uses ./{DEFAULT_ARCHIVE_NAME}.",
+    )
+    # App role (owner of AEDB) for the load stage
+    prov.add_argument("--app-user", default="aauser")
+    prov.add_argument("--app-pass", default="Automic123")
+
+    # ---- all: mirrors provision for now
+    allp = sub.add_parser(
+        "all",
+        parents=[common],
+        help="Provision/reuse infra, upload & load AEDB, then (optionally) install AE/AWI/SM",
+    )
+    allp.add_argument(
+        "--automic-zip",
+        required=False,
+        type=Path,
+        help=f"Path to Automic bundle (.zip/.tar.gz). If omitted, uses ./{DEFAULT_ARCHIVE_NAME}.",
+    )
+    allp.add_argument("--app-user", default="aauser")
+    allp.add_argument("--app-pass", default="Automic123")
+
+    # ---- install-db: run AEDB load standalone (archive must already be on remote host)
+    instdb = sub.add_parser(
+        "install-db",
+        parents=[common],
+        help="Install/initialize AEDB schema on PostgreSQL (standalone).",
+    )
+    instdb.add_argument("--db-host", required=True, help="DB host (EC2 IP/DNS)")
+    instdb.add_argument("--key-path", required=True, help="Path to PEM key")
+    instdb.add_argument("--remote-zip", required=True, help="Path to Automic media on the remote host")
+    # Tablespaces toggles
+    instdb.add_argument("--with-tablespaces", action="store_true",
+                        help="Create tablespaces and use them instead of pg_default")
+    instdb.add_argument("--ts-data-name", default="ae_data")
+    instdb.add_argument("--ts-index-name", default="ae_index")
+    instdb.add_argument("--ts-data-path", default="/pgdata/ts/AE_DATA")
+    instdb.add_argument("--ts-index-path", default="/pgdata/ts/AE_INDEX")
+    # App role (owner of AEDB)
+    instdb.add_argument("--app-user", default="aauser")
+    instdb.add_argument("--app-pass", default="Automic123")
+
+    # ---- install-ae: configure Automation Engine (no start; SM handles lifecycle)
+    ae = sub.add_parser(
+        "install-ae",
+        parents=[common],
+        help="Configure Automation Engine (ucsrv.ini, JDBC, ports). Starting handled later by Service Manager.",
+    )
+    ae.add_argument("--ae-host", required=True, help="AE host (EC2 public IP/DNS)")
+    ae.add_argument("--key-path", required=True, help="Path to PEM key")
+    ae.add_argument("--remote-unzip-root", default="/opt/automic/install", help="Remote unzip root created by DB stage")
+    ae.add_argument("--jdbc-jar", default=None, help="Local path to postgresql-*.jar")
+    ae.add_argument("--db-host", required=True, help="PostgreSQL host/IP")
+    # AE connects with the app user/pass:
+    ae.add_argument("--db-password", required=True, help="Password for --db-user (defaults to aauser)")
+    ae.add_argument("--jcp-port", type=int, default=8843)
+    ae.add_argument("--rest-port", type=int, default=8088)
+    ae.add_argument("--enable-tls", action="store_true")
+
+    # ---- verify
+    sub.add_parser(
+        "verify",
+        parents=[common],
+        help="Run verification checks (logs, versions, connectivity)",
+    )
+
+    # ---- backup-db (lazy-imported implementation)
+    sub.add_parser(
+        "backup-db",
+        parents=[common],
+        help="Backup the AEDB using pg_dump",
+    )
+    # ---- verify-db: lightweight AEDB smoke check
+    vdb = sub.add_parser(
+        "verify-db",
+        parents=[common],
+        help="Check AEDB: version, extensions, key tables (ids/ah/eca).",
+    )
+    vdb.add_argument("--db-host", required=True, help="DB host (EC2 IP/DNS)")
+    vdb.add_argument("--key-path", required=True, help="Path to PEM key")
+
+
+    # ---- deprovision
+    deprov = sub.add_parser(
+        "deprovision",
+        parents=[common],
+        help="Tear down AWS resources created by provision (EC2, SG, key pair)",
+    )
+    deprov.add_argument(
+        "--name-prefix",
+        action="append",
+        default=["automic-", "AEDB", "AE", "AWI"],
+        help="Instance Name tag prefixes to match (repeatable). Default: %(default)r",
+    )
+
+    return p
+def _settings_from_args(args: argparse.Namespace) -> Settings:
+    """
+    Build a Settings object from DEF_SETTINGS + CLI overrides.
+    Compatible with namedtuple, dataclass, Pydantic v1/v2, or plain class.
+    """
+    updates = dict(
+        region=args.region,
+        vpc_id=args.vpc_id,
+        sg_name=args.sg_name,
+        key_name=args.key_name,
+        key_dir=Path(args.key_dir),
+        db_name=args.db_name,
+        ae_name=args.ae_name,
+        awi_name=args.awi_name,
+        db_type=args.db_type,
+        ae_type=args.ae_type,
+        awi_type=args.awi_type,
+        db_sys_pass=args.db_sys_pass,
+        ssh_user=args.ssh_user,
+        remote_install_root=args.remote_install_root,
+        remote_utils=args.remote_utils,
+        db_user=args.db_user,  # keep for AE stage defaults
+    )
+
+    base = DEF_SETTINGS
+
+    # 1) namedtuple-style
+    if hasattr(base, "_replace"):
+        return base._replace(**updates)  # type: ignore[attr-defined]
+
+    # 2) dataclass
+    try:
+        import dataclasses
+        if dataclasses.is_dataclass(base):
+            return dataclasses.replace(base, **updates)  # type: ignore[arg-type]
+    except Exception:
+        pass
+
+    # 3) Pydantic v2
+    if hasattr(base, "model_copy"):
+        return base.model_copy(update=updates)  # type: ignore[attr-defined]
+
+    # 4) Pydantic v1
+    if hasattr(base, "copy"):
+        try:
+            return base.copy(update=updates)  # type: ignore[attr-defined]
+        except TypeError:
+            data = base.dict()  # type: ignore[attr-defined]
+            data.update(updates)
+            return Settings(**data)
+
+    # 5) Plain class with keyword constructor — rebuild from vars()
+    try:
+        data = {**getattr(base, "__dict__", {}), **updates}
+        return Settings(**data)
+    except Exception:
+        # 6) Last resort: mutate a shallow clone
+        import copy
+        s = copy.copy(base)
+        for k, v in updates.items():
+            setattr(s, k, v)
+        return s
+
+
+def _resolve_archive_path(p: Path | None) -> Path:
+    """
+    No prompt. If --automic-zip not given, assume DEFAULT in CWD.
+    Fail fast if the file isn't found.
+    """
+    def _norm(x: Path) -> Path:
+        return Path(x).expanduser().resolve()
+
+    path = _norm(p) if p else _norm(Path(DEFAULT_ARCHIVE_NAME))
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Automic archive not found: {path} "
+            f"(expected {DEFAULT_ARCHIVE_NAME} in the current directory or pass --automic-zip)"
+        )
+    return path
+def _do_provision(args: argparse.Namespace) -> int:
+    setup_logging(verbosity=1, logfile=args.log_file)
+    settings = _settings_from_args(args)
+    logging.info("=== Provision start (region=%s) ===", settings.region)
+
+    # 1) Provision/reuse infra; return connection details & key path
+    try:
+        pw = getattr(settings, "db_sys_pass", None) or getattr(settings, "db_password", None)
+        if not pw:
+            raise RuntimeError("DB password missing in Settings (expected db_sys_pass or db_password).")
+
+        stack = launch_automic_stack(settings, db_user_pass=pw)
+
+        db_ip_val = stack["db_ip"] if isinstance(stack, dict) and "db_ip" in stack else None
+        key_path_val = stack["key_path"] if isinstance(stack, dict) and "key_path" in stack else None
+
+        db_ip = str(db_ip_val) if db_ip_val is not None else ""
+        key_path = Path(str(key_path_val)) if key_path_val is not None else None
+
+        if not db_ip:
+            raise RuntimeError("launch_automic_stack did not return a DB IP address")
+        if key_path is None:
+            raise RuntimeError("launch_automic_stack did not return a key_path")
+
+        logging.info("Provisioned: db_ip=%s, key=%s", db_ip, key_path)
+    except Exception as e:
+        logging.exception("Provision failed: %s", e)
+        return 2
+
+    # 2) Resolve archive path, then upload & load AEDB
+    if upload_automic_archive is None:
+        logging.error("transfer module failed to import: %r", _TRANSFER_IMPORT_ERROR)
+        return 3
+    if run_db_load is None:
+        logging.error("db_load module failed to import: %r", _DBLOAD_IMPORT_ERROR)
+        return 5
+
+    try:
+        # archive -> remote
+        archive = _resolve_archive_path(getattr(args, "automic_zip", None))
+        remote_zip = upload_automic_archive(archive, db_ip, key_path)
+        logging.info("Uploaded archive to %s", remote_zip)
+
+        # determine creds & paths
+        ssh_user = getattr(settings, "ssh_user", "ec2-user")
+        # App owner for AEDB load (provision/all expose explicit flags)
+        app_user = getattr(args, "app_user", "aauser")
+        app_pass = getattr(args, "app_pass", "Automic123")
+
+        remote_install_root = getattr(settings, "remote_install_root", "/opt/automic/install")
+        remote_utils = getattr(settings, "remote_utils", "/opt/automic/utils")
+
+        # run db load
+        run_db_load(
+            db_host=db_ip,
+            key_path=str(key_path),
+            db_name=getattr(settings, "db_name", "AEDB"),
+            app_user=app_user,
+            app_pass=app_pass,
+            remote_zip=remote_zip,
+            ssh_user=ssh_user,
+            remote_install_root=remote_install_root,
+            remote_utils=remote_utils,
+        )
+        logging.info("AEDB load completed.")
+    except Exception as e:
+        logging.exception("Upload or AEDB load failed: %s", e)
+        return 6
+
+    logging.info("=== Provision complete ===")
+    print(f"DB IP: {db_ip}")
+    print(f"Key:   {key_path}")
+    return 0
+
+
+def _do_install_db(args: argparse.Namespace) -> int:
+    """Standalone AEDB load against an existing DB host; archive already on the remote host."""
+    setup_logging(verbosity=1, logfile=args.log_file)
+    if run_db_load is None:
+        logging.error("db_load module failed to import: %r", _DBLOAD_IMPORT_ERROR)
+        return 5
+
+    try:
+        run_db_load(
+            db_host=args.db_host,
+            key_path=str(args.key_path),
+            db_name=args.db_name,
+            app_user=args.app_user,
+            app_pass=args.app_pass,
+            remote_zip=args.remote_zip,  # already on remote host
+            ssh_user=args.ssh_user,
+            remote_install_root=args.remote_install_root,
+            remote_utils=args.remote_utils,
+            with_tablespaces=bool(args.with_tablespaces),
+            ts_data_name=args.ts_data_name,
+            ts_index_name=args.ts_index_name,
+            ts_data_path=args.ts_data_path,
+            ts_index_path=args.ts_index_path,
+        )
+        logging.info("AEDB install-db completed.")
+        return 0
+    except Exception as e:
+        logging.exception("install-db failed: %s", e)
+        return 7
+
+
+
+def _do_verify_db(args: argparse.Namespace) -> int:
+    """Lightweight AEDB smoke check over SSH."""
+    setup_logging(verbosity=1, logfile=args.log_file)
+
+    host = args.db_host
+    user = args.ssh_user
+    key_path = str(args.key_path)
+    db = args.db_name
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        pkey = paramiko.RSAKey.from_private_key_file(key_path)
+        client.connect(hostname=host, username=user, pkey=pkey, port=22, timeout=30, banner_timeout=30, auth_timeout=30)
+
+        def run(cmd: str) -> tuple[int, str, str]:
+            full = f"/bin/bash -lc {shlex.quote(cmd)}"
+            stdin, stdout, stderr = client.exec_command(full)
+            rc = stdout.channel.recv_exit_status()
+            out = stdout.read().decode("utf-8", "ignore")
+            err = stderr.read().decode("utf-8", "ignore")
+            return rc, out, err
+
+        def psql(sql: str) -> str:
+            rc, out, err = run(f"sudo -u postgres psql -d {shlex.quote(db)} -Atqc {shlex.quote(sql)}")
+            if rc != 0:
+                raise RuntimeError(f"psql failed: {sql}\nSTDOUT:\n{out}\nSTDERR:\n{err}")
+            return out.strip()
+
+        rows = {
+            "pg_version": psql("select version();"),
+            "ext_pgcrypto": psql("select count(*) from pg_extension where extname='pgcrypto';"),
+            "ext_uuid_ossp": psql("select count(*) from pg_extension where extname='uuid-ossp';"),
+            "has_ids": psql("select count(*) from pg_class where relname='ids';"),
+            "has_ah": psql("select count(*) from pg_class where relname='ah';"),
+            "has_eca": psql("select count(*) from pg_class where relname='eca';"),
+        }
+
+        print("== AEDB check ==")
+        print(f"- version: {rows['pg_version']}")
+        print(f"- pgcrypto installed: {'yes' if rows['ext_pgcrypto']!='0' else 'no'}")
+        print(f"- uuid-ossp installed: {'yes' if rows['ext_uuid_ossp']!='0' else 'no'}")
+        print(f"- tables: ids={rows['has_ids']} ah={rows['has_ah']} eca={rows['has_eca']}")
+        return 0
+    except Exception as e:
+        logging.exception("verify-db failed: %s", e)
+        return 12
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+
+def _do_install_ae(args: argparse.Namespace) -> int:
+    """Configure AE in-place; Service Manager will own start/stop later."""
+    setup_logging(verbosity=1, logfile=args.log_file)
+
+    if run_install_ae is None or AEInstallConfig is None:
+        logging.error("install-ae unavailable: %r", _AE_IMPORT_ERROR)
+        return 30
+
+    try:
+        cfg = AEInstallConfig(
+            ae_host=args.ae_host,
+            key_path=str(args.key_path),
+            ssh_user=args.ssh_user,
+            remote_unzip_root=str(args.remote_unzip_root),
+            jdbc_jar=str(args.jdbc_jar) if args.jdbc_jar else None,
+            db_host=args.db_host,
+            db_name=args.db_name,
+            db_user=args.db_user,            # AE connects as app user (default aauser)
+            db_password=args.db_password,    # required
+            jcp_port=int(args.jcp_port),
+            rest_port=int(args.rest_port),
+            enable_tls=bool(args.enable_tls),
+        )
+        ae_root = run_install_ae(cfg)  # type: ignore[call-arg]
+        logging.info("AE root: %s", ae_root)
+        print(ae_root)
+        return 0
+    except Exception as e:
+        logging.exception("install-ae failed: %s", e)
+        return 31
+
+
+def _do_all(args: argparse.Namespace) -> int:
+    rc = _do_provision(args)
+    if rc != 0:
+        return rc
+    logging.info("[all] AE/AWI/SM stages not wired yet in this CLI build.")
+    return 0
+
+
+def _do_verify(args: argparse.Namespace) -> int:
+    setup_logging(verbosity=1, logfile=args.log_file)
+    if final_verification is None:
+        logging.error("verify module failed to import: %r", _VERIFY_IMPORT_ERROR)
+        return 10
+    try:
+        settings = _settings_from_args(args)
+        final_verification(settings)  # type: ignore[arg-type]
+        logging.info("Verification complete.")
+        return 0
+    except Exception as e:
+        logging.exception("Verification failed: %s", e)
+        return 11
+
+
+def _do_backup(args: argparse.Namespace) -> int:
+    """Lazy-import backup implementation to avoid symbol errors when absent."""
+    setup_logging(verbosity=1, logfile=args.log_file)
+    try:
+        import importlib
+        mod = importlib.import_module(".components.backup", package=__package__)
+        backup_database = getattr(mod, "backup_database")
+    except Exception as e:
+        logging.error("backup-db unavailable (components.backup import failed): %r", e)
+        return 20
+
+    try:
+        settings = _settings_from_args(args)
+        backup_database(settings)  # type: ignore[misc]
+        logging.info("Backup complete.")
+        return 0
+    except Exception as e:
+        logging.exception("Backup failed: %s", e)
+        return 21
+
+
+def _do_deprovision(args: argparse.Namespace) -> int:
+    """Tear down AWS resources created by provision."""
+    import time
+    import boto3
+    from botocore.exceptions import ClientError
+
+    setup_logging(verbosity=1, logfile=args.log_file)
+    settings = _settings_from_args(args)
+    logging.info("=== Deprovision start (region=%s) ===", settings.region)
+
+    ec2 = boto3.client("ec2", region_name=settings.region)
+
+    def find_automic_instances(name_prefixes: list[str] = ["automic-", "AEDB", "AE", "AWI"]) -> list[str]:
+        resp = ec2.describe_instances(
+            Filters=[{"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]}]
+        )
+        ids: list[str] = []
+        reservations = cast(List[Dict[str, Any]], _as_list(_dg(resp, "Reservations", [])))
+        for res in reservations:
+            instances = cast(List[Dict[str, Any]], _as_list(_dg(res, "Instances", [])))
+            for inst in instances:
+                tags = cast(List[Dict[str, Any]], _as_list(_dg(inst, "Tags", [])))
+                for tag in tags:
+                    key_name = str(_dg(tag, "Key", ""))
+                    val = str(_dg(tag, "Value", ""))
+                    if key_name == "Name" and any(val.startswith(p) for p in name_prefixes):
+                        ids.append(str(inst["InstanceId"]))
+                        break
+        return ids
+
+    def terminate_instances(ids: list[str]) -> None:
+        if not ids:
+            logging.info("No Automic instances found to terminate.")
+            return
+        logging.info("Terminating instances: %s", ids)
+        ec2.terminate_instances(InstanceIds=ids)
+        waiter = ec2.get_waiter("instance_terminated")
+        waiter.wait(InstanceIds=ids)
+        logging.info("Instance termination complete.")
+
+    def delete_security_group(sg_name: str, vpc_id: str | None = None) -> None:
+        filters = [{"Name": "group-name", "Values": [sg_name]}]
+        if vpc_id:
+            filters.append({"Name": "vpc-id", "Values": [vpc_id]})
+        resp = ec2.describe_security_groups(Filters=filters)
+        groups = cast(List[Dict[str, Any]], _as_list(_dg(resp, "SecurityGroups", [])))
+        if not groups:
+            logging.info("Security group '%s' not found.", sg_name)
+            return
+        sg_id = str(_dg(groups[0], "GroupId", ""))
+        if not sg_id:
+            logging.info("Security group had no GroupId; skipping delete.")
+            return
+        try:
+            ec2.delete_security_group(GroupId=sg_id)
+            logging.info("Security group deleted.")
+        except ClientError as e:
+            logging.warning("Initial deletion failed: %s", e)
+            if "DependencyViolation" in str(e):
+                logging.info("Retrying SG delete after 10s...")
+                time.sleep(10)
+                ec2.delete_security_group(GroupId=sg_id)
+                logging.info("Security group deleted after retry.")
+
+    def delete_key_pair(key_name: str, pem_dir: Path) -> None:
+        try:
+            ec2.delete_key_pair(KeyName=key_name)
+            logging.info("AWS key pair deleted.")
+        except ClientError as e:
+            logging.warning("Could not delete AWS key pair: %s", e)
+        pem_path = pem_dir / f"{key_name}.pem"
+        if pem_path.exists():
+            pem_path.unlink()
+            logging.info("Local PEM deleted at %s.", pem_path)
+
+    ids = find_automic_instances(getattr(args, "name_prefix", None) or ["automic-", "AEDB", "AE", "AWI"])
+    terminate_instances(ids)
+    delete_security_group(settings.sg_name, getattr(settings, "vpc_id", None))
+    delete_key_pair(settings.key_name, settings.key_dir)
+
+    logging.info("=== Deprovision complete ===")
+    return 0
+
+
+def main(argv: List[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    parser = _build_parser()
+
+    if not argv:
+        parser.print_help()
+        return 2
+
+    args = parser.parse_args(argv)
+
+    # Dispatch table for subcommands
+    dispatch = {
+        "provision": _do_provision,
+        "all": _do_all,
+        "install-db": _do_install_db,
+        "install-ae": _do_install_ae,
+        "verify": _do_verify,
+        "verify-db": _do_verify_db,
+        "backup-db": _do_backup,
+        "deprovision": _do_deprovision,
+    }
+
+    cmd = getattr(args, "cmd", None)
+    if cmd is None:
+        parser.print_help()
+        return 2
+
+    func = dispatch[cmd]
+    return func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
