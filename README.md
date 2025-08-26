@@ -2,7 +2,7 @@
 # Automic Bootstrap — Updated Baseline
 
 This project automates the **provisioning, installation, and verification** of an Automic Automation stack on AWS.  
-It supports a **full pipeline run** (recommended) or infrastructure-only provisioning.
+It supports a **full pipeline run** (recommended) or infrastructure-only provisioning..
 
 ---
 

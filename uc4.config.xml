@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <trace count="10" xml="0"/>
+  <connections trustedCertFolder="/opt/automic/tls">
+    <connection name="AUTOMIC" system="AELAB">
+      <jcp ip="'$AE_IP'" port="2217"/>
+    </connection>
+  </connections>
+</configuration>
