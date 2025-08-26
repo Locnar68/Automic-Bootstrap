@@ -1,207 +1,42 @@
+
 # Automic Bootstrap — Updated Baseline
 
-## Quick start
-
-```powershell
-pip install -e .
-automic-bootstrap --help
-
-# Provision only (returns IPs)
-automic-bootstrap --region us-east-1 provision
-
-# Full pipeline
-automic-bootstrap all `
-  --automic-zip C:\path\to\Automic.Automation_24.4.1_2025-07-25.zip `
-  --sm-tar C:\path\to\ucsmgrlx6.tar.gz
-```
-
-## Automic AEDB Bootstrap & Verification
-
-This project automates the provisioning, loading, and verification of an Automic Automation database (AEDB) on PostgreSQL. It includes:
-- Creation of the application role (`aauser`) with privileges.
-- Required PostgreSQL extensions (`pgcrypto`, `uuid-ossp`).
-- Tablespaces creation and assignment (`ae_data`, `ae_index`).
-- Unzipping and deploying the Automic media archive.
-- Executing base schema and steps SQL scripts.
-- Running a verification smoke test.
-
-All accomplished using the art of **Vibe Coding with ChatGPT**.
-
-### What Is Vibe Coding with ChatGPT?
-
-Instead of a rigid spec, Vibe Coding means:
-1. Describing the goal in natural language.
-2. Iterating with ChatGPT to design scripts, run tests, debug.
-3. Adapting instantly based on output and feedback.
-4. Integrating Bash, Python, and SQL across remote systems..
-
-### Requirements
-
-- PostgreSQL 16
-- postgresql16-contrib
-- SSH access to DB server
-- Automic Automation ZIP (from Broadcom/Automic portal)
-
-### About the Automic ZIP
-
-This repository does not contain the Automic Automation installation media. Download it from your licensed Broadcom/Automic portal and upload to:  
-`/opt/automic/install/Automic.Automation_<version>.zip`
-
-### How to Use
-
-1. Clone repo.
-2. Ensure SSH key & DB server IP.
-3. Run bootstrap:
-   ```bash
-   python -m automic_bootstrap.components.db_load --db-host <host> --key-path /path/to/key.pem --db-name AEDB --db-user postgres --db-password <password> --remote-zip /opt/automic/install/Automic.Automation_<version>.zip
-   ```
-4. SSH into DB server.
-5. Run:
-   ```bash
-   APPUSER=aauser APPPASS=Automic123 bash /tmp/aedb_smoke.sh
-   ```
-6. Review log output for verification.
-
-### Credits
-
-All development/troubleshooting completed collaboratively via Vibe Coding with ChatGPT, using SSH sessions, SQL inspection, and infrastructure scripting.
-
----
-
-
-# Automic AEDB Bootstrap & Verification
-
-This project automates the provisioning, installation, and verification of an Automic Automation stack on AWS, including PostgreSQL AEDB, AE Engine, AWI, Service Manager, Agents, and Analytics.
-
-It supports **step-by-step installs** or a **full pipeline** run.
-
----
-
-## Automic AEDB Bootstrap & Verification
-
-This project automates the provisioning, loading, and verification of an Automic Automation database (AEDB) on PostgreSQL. It includes:
-
-- Creation of the application role (`aauser`) with privileges.
-- Required PostgreSQL extensions (`pgcrypto`, `uuid-ossp`).
-- Tablespaces creation and assignment (`ae_data`, `ae_index`).
-- Unzipping and deploying the Automic media archive.
-- Executing base schema and steps SQL scripts.
-- Running a verification smoke test.
-
-All accomplished using the art of **Vibe Coding with ChatGPT**.
-
----
-
-### What Is Vibe Coding with ChatGPT?
-
-Instead of a rigid spec, Vibe Coding means:
-
-1. Describing the goal in natural language.
-2. Iterating with ChatGPT to design scripts, run tests, debug.
-3. Adapting instantly based on output and feedback.
-4. Integrating Bash, Python, and SQL across remote systems.
+This project automates the **provisioning, installation, and verification** of an Automic Automation stack on AWS.  
+It supports a **full pipeline run** (recommended) or infrastructure-only provisioning.
 
 ---
 
 ## Quick Start
 
-### 1. Create & Activate a Virtual Environment
-It’s strongly recommended to run inside a virtual environment to keep dependencies isolated:
-
+### 1. Virtual Environment (recommended)
 ```bash
-# Create venv
 python -m venv .venv
+source .venv/bin/activate   # Linux/Mac
+.venv\Scripts\Activate.ps1  # Windows PowerShell
 
-# Activate venv (Linux/Mac)
-source .venv/bin/activate
-
-# Activate venv (Windows PowerShell)
-.venv\Scripts\Activate.ps1
-2. Install in Editable Mode
-bash
-Copy
-Edit
+2. Install
 pip install -e .
-3. View CLI Help
-bash
-Copy
-Edit
-automic-bootstrap --help
-Common Commands
-Provision Only (returns IPs)
-bash
-Copy
-Edit
-automic-bootstrap --region us-east-1 provision
-Full Pipeline
-powershell
-Copy
-Edit
+
+3. Run Full Pipeline
 automic-bootstrap all `
   --automic-zip C:\path\to\Automic.Automation_24.4.1_2025-07-25.zip `
   --sm-tar C:\path\to\ucsmgrlx6.tar.gz
-Stage-by-Stage Install
-bash
-Copy
-Edit
-automic-bootstrap install-db
-automic-bootstrap install-ae
-automic-bootstrap install-awi
-automic-bootstrap install-sm
-automic-bootstrap install-agents --unix --windows --sql --rest
-automic-bootstrap install-analytics
-automic-bootstrap verify
-Deprovision AWS Resources
-When you’re done testing, clean up AWS infrastructure to avoid charges:
 
-bash
-Copy
-Edit
-# Remove EC2, security groups, and key pair
-automic-bootstrap deprovision --region us-east-1
+Command Reference
 
-# Remove specific stack by name
-automic-bootstrap deprovision --region us-east-1 --stack-name MyAutomicStack
-About the Automic ZIP
-This repository does not contain the Automic Automation installation media.
-Download it from your licensed Broadcom/Automic portal and upload to:
+automic-bootstrap all →
+Provisions AWS infra and installs AEDB, AE Engine, AWI, Service Manager, Agents, and Analytics.
+✅ This is the main command you should use.
 
-swift
-Copy
-Edit
-/opt/automic/install/Automic.Automation_<version>.zip
-How to Use
-Clone repo
+automic-bootstrap provision →
+Creates AWS infra only (returns IPs).
+Useful for debugging infra, but does not install Automic.
 
-Ensure SSH key & DB server IP
-
-Run bootstrap
-
-bash
-Copy
-Edit
-python -m automic_bootstrap.components.db_load \
-  --db-host <host> \
-  --key-path /path/to/key.pem \
-  --db-name AEDB \
-  --db-user postgres \
-  --db-password <password> \
-  --remote-zip /opt/automic/install/Automic.Automation_<version>.zip
-SSH into DB server
-
-Run smoke test
-
-bash
-Copy
-Edit
-APPUSER=aauser APPPASS=Automic123 bash /tmp/aedb_smoke.sh
-Review log output for verification
+automic-bootstrap --help →
+Shows all commands and options.
 
 Architecture Overview
-AWS Resource Diagram
-markdown
-Copy
-Edit
+AWS Resource Design
           ┌───────────────────────────────────────┐
           │              AWS Cloud                 │
           │                                         │
@@ -219,45 +54,72 @@ Edit
           │   └───────────┘       └───────────┘     │
           │                                         │
           └─────────────────────────────────────────┘
+
 CLI Workflow
-pgsql
-Copy
-Edit
  ┌────────────┐
- │ provision  │  →  Launch AWS infra (VPC, SG, EC2) + user-data
+ │ provision  │ → Launch AWS infra (VPC, SG, EC2) + user-data
  └─────┬──────┘
        ↓
  ┌────────────┐
- │ install-db │  →  PostgreSQL + AEDB schema + tablespaces
+ │ install-db │ → PostgreSQL + AEDB schema + tablespaces
  └─────┬──────┘
        ↓
  ┌───────────────┐
- │ install-ae    │  →  AE Engine config + TLS + JDBC
+ │ install-ae    │ → AE Engine config + TLS + JDBC
  └─────┬─────────┘
        ↓
  ┌───────────────┐
- │ install-awi   │  →  AWI + JCP CN mapping
+ │ install-awi   │ → AWI + JCP CN mapping
  └─────┬─────────┘
        ↓
  ┌───────────────┐
- │ install-sm    │  →  Service Manager + UC4 definitions
+ │ install-sm    │ → Service Manager + UC4 definitions
  └─────┬─────────┘
        ↓
  ┌───────────────┐
- │ install-agents│  →  Unix / Windows / SQL / REST agents
+ │ install-agents│ → Unix / Windows / SQL / REST agents
  └─────┬─────────┘
        ↓
  ┌───────────────┐
- │ install-analytics │  →  Analytics datastore + props
+ │ install-analytics │ → Analytics datastore + props
  └─────┬─────────┘
        ↓
  ┌────────────┐
- │ verify     │  →  Health checks, log verification
+ │ verify     │ → Health checks, log verification
  └─────┬──────┘
        ↓
  ┌──────────────┐
- │ deprovision  │  →  Destroy AWS resources & clean up
+ │ deprovision  │ → Destroy AWS resources & clean up
  └──────────────┘
-Credits
-All development and troubleshooting completed collaboratively via Vibe Coding with ChatGPT,
-using SSH sessions, SQL inspection, and AWS infrastructure scripting.
+
+About the Automic ZIP
+
+This repo does not contain Broadcom Automic installation media.
+Download from your licensed Broadcom/Automic portal and upload to:
+
+/opt/automic/install/Automic.Automation_<version>.zip
+
+Development Method
+
+All automation here was created through VibeCoding by Mike Pepe —
+a live, iterative style of coding that adapts instantly to feedback, tests, and results.
+
+More Details
+
+See docs/USAGE.md
+ for:
+
+Stage-by-stage installs (install-db, install-awi, etc.)
+
+Deprovisioning AWS resources
+
+Smoke tests and verification
+
+Full architecture notes
+
+
+---
+
+✅ This is **ready to copy-paste** into GitHub and will keep the formatting exactly as you see it.  
+
+Do you want me to now **write the full `docs/USAGE.md`** (expanded commands, smoke tests, teardown, diagrams) so you have the split structure complete?
