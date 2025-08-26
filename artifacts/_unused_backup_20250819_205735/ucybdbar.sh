@@ -1,0 +1,1 @@
+java -jar ucybdbar.jar

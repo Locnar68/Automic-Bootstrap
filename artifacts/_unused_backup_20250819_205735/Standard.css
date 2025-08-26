@@ -1,0 +1,22 @@
+th,td {
+	font-family: arial;
+	font-size: 0.8em;
+}
+
+th {
+	background: rgb(77,148,255);
+	color: white;
+}
+
+td {
+	border: 1px solid rgb(208,213,217);
+}
+
+table {
+	border: 1px solid grey;	
+	background: white;
+}
+
+body {
+	background: rgb(208,213,217);
+}
